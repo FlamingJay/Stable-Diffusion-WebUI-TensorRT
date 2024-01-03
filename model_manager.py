@@ -92,7 +92,7 @@ class ModelManager:
     def add_entry(
         self,
         model_name,
-        model_hash,
+        trt_name,
         profile,
         static_shapes,
         fp32,
@@ -104,9 +104,6 @@ class ModelManager:
     ):
         config = ModelConfig(
             profile, static_shapes, fp32, inpaint, refit, lora, vram, unet_hidden_dim
-        )
-        trt_name, trt_path = self.get_trt_path(
-            model_name, model_hash, profile, static_shapes
         )
 
         base_model_name = f"{model_name}"  # _{model_hash}
@@ -134,6 +131,22 @@ class ModelManager:
         self.all_models[self.cc][lora_name] = [
             {
                 "filepath": trt_lora_path,
+                "base_model": base_model,
+                "config": config,
+            }
+        ]
+
+        self.write_json()
+
+    def add_controlnet_entry(self, base_model, control_name, trt_control_path, fp32, inpaint=False, vram=0,
+                             unet_hidden_dim=4):
+        config = ModelConfig(
+            [[], [], []], False, fp32, inpaint, True, False, vram, unet_hidden_dim
+        )
+
+        self.all_models[self.cc][control_name] = [
+            {
+                "filepath": trt_control_path,
                 "base_model": base_model,
                 "config": config,
             }

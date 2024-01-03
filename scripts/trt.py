@@ -1,6 +1,6 @@
 import os
 import numpy as np
-
+import time
 import torch
 from torch.cuda import nvtx
 from modules import (
@@ -50,9 +50,7 @@ class TrtUnet(sd_unet.SdUnet):
 
         self.profile_idx = GLOBAL_KWARGS["profile_idx"]
         self.loaded_config = self.configs[self.profile_idx]
-        self.engine = Engine(
-            os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
-        )
+        self.engine = Engine(os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"]))
 
     def forward(self, x, timesteps, context, *args, **kwargs):
         nvtx.range_push("forward")
@@ -80,25 +78,27 @@ class TrtUnet(sd_unet.SdUnet):
         return out
 
     def switch_engine(self):
-        self.profile_idx = GLOBAL_KWARGS["profile_idx"]
-        self.loaded_config = self.configs[self.profile_idx]
-        self.deactivate()
-        self.engine = Engine(
-            os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
-        )
-        self.activate()
+        if self.profile_idx != GLOBAL_KWARGS["profile_idx"]:
+            self.profile_idx = GLOBAL_KWARGS["profile_idx"]
+            self.loaded_config = self.configs[self.profile_idx]
+            self.deactivate()
+            self.engine = Engine(
+                os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
+            )
+            self.activate()
 
-    def activate(self):
-        self.engine.load()
-        print(f"\nLoaded Profile: {self.profile_idx}")
-        print(self.engine)
-        self.engine_vram_req = self.engine.engine.device_memory_size
-        self.engine.activate(True)
-
+    def refit_loras(self):
         if GLOBAL_KWARGS["refit_dict"] is not None:
             nvtx.range_push("refit")
             self.engine.refit_from_dict(GLOBAL_KWARGS["refit_dict"])
             nvtx.range_pop()
+
+    def activate(self):
+        self.engine.load()
+        print(f"**** engine is: {self.engine} ****")
+        self.engine_vram_req = self.engine.engine.device_memory_size
+        self.engine.activate(True)
+        self.refit_loras()
 
     def deactivate(self):
         self.shape_hash = 0
@@ -142,7 +142,7 @@ class TensorRTScript(scripts.Script):
 
         if not sd_unet_option.model_name == p.sd_model_name:
             gr.Error(
-                """Selected torch model ({}) does not match the selected TensorRT U-Net ({}). 
+                """Selected torch model ({}) does not match the selected TensorRT U-Net ({}).
                 Please ensure that both models are the same or select Automatic from the SD UNet dropdown.""".format(
                     p.sd_model_name, sd_unet_option.model_name
                 )
@@ -158,7 +158,7 @@ class TensorRTScript(scripts.Script):
         )  # TODO: max_embedding, just irnore?
         if len(valid_models) == 0:
             gr.Error(
-                """No valid profile found for LOWRES. Please go to the TensorRT tab and generate an engine with the necessary profile. 
+                """No valid profile found for LOWRES. Please go to the TensorRT tab and generate an engine with the necessary profile.
                 If using hires.fix, you need an engine for both the base and upscaled resolutions. Otherwise, use the default (torch) U-Net."""
             )
         best = idx[np.argmin(distances)]
@@ -191,6 +191,8 @@ class TensorRTScript(scripts.Script):
         self.get_loras(p)
 
     def get_loras(self, p):
+        print("**** TensorRTScript get_loras ****")
+        start = time.time()
         lora_pathes = []
         lora_scales = []
 
@@ -215,7 +217,7 @@ class TensorRTScript(scripts.Script):
             return
 
         # Get pathes
-        print("Apllying LoRAs: " + str(loras))
+        print("Applying LoRAs: " + str(loras))
         for lora in loras:
             lora_name, lora_scale = lora.split(":")[1:]
             lora_scales.append(float(lora_scale))
@@ -235,9 +237,12 @@ class TensorRTScript(scripts.Script):
             modelmanager.available_models()[lora_name][0]["base_model"]
         ).hash
         base_name, base_path = modelmanager.get_onnx_path(p.sd_model_name, model_hash)
-        refit_dict = apply_loras(base_path, lora_pathes, lora_scales)
 
+        second = time.time()
+        refit_dict = apply_loras(base_path, lora_pathes, lora_scales)
+        print(f"**** lora.py apply_loras time cost: {time.time() - second}s ****")
         GLOBAL_KWARGS["refit_dict"] = refit_dict
+        print(f"**** Apllying LoRAs: {loras} FINISHED time cost: {time.time() - start} ****")
 
     def process_batch(self, p, *args, **kwargs):
         # Called for each batch count
@@ -252,7 +257,7 @@ class TensorRTScript(scripts.Script):
             self.update_lora = False
             # Not the fastest, but safest option. Larger bottlenecks to solve first!
             # Other two options: Overengingeer, Refit whole model
-            sd_unet.current_unet.switch_engine()
+            sd_unet.current_unet.refit_loras()
 
 
 def list_unets(l):

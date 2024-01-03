@@ -6,12 +6,14 @@ import time
 import shutil
 import onnx_graphsurgeon as gs
 import numpy as np
-from safetensors.numpy import save_file
+from safetensors.numpy import save_file, load_file
 from modules import sd_hijack, sd_unet, shared
 import gc
 
 from utilities import Engine
 import os
+from controlnet.ControlUnet import ControlUnet
+from ldm.modules.diffusionmodules.openaimodel import UNetModel
 
 
 def get_cc():
@@ -44,12 +46,13 @@ def apply_lora(model, lora_path, inputs):
 
 
 def export_onnx(
-    onnx_path,
-    modelobj=None,
-    profile=None,
-    opset=17,
-    diable_optimizations=False,
-    lora_path=None,
+        onnx_path,
+        modelobj=None,
+        profile=None,
+        opset=17,
+        diable_optimizations=False,
+        lora_path=None,
+        model=None
 ):
     swap_sdpa = hasattr(F, "scaled_dot_product_attention")
     old_sdpa = getattr(F, "scaled_dot_product_attention", None) if swap_sdpa else None
@@ -75,15 +78,23 @@ def export_onnx(
         info("Exporting to ONNX...")
         with torch.inference_mode(), torch.autocast("cuda"):
             inputs = modelobj.get_sample_input(
-                profile["sample"][1][0] // 2,
+                profile["sample"][1][0],
                 profile["sample"][1][-2] * 8,
                 profile["sample"][1][-1] * 8,
             )
-            model = shared.sd_model.model.diffusion_model
+            if model is None:
+                model = shared.sd_model.model.diffusion_model
+                if modelobj.unet_use_controlnet():
+                    print(f"Applying ControlUnet forward")
+                    model._original_forward = model.forward
+                    model.forward = ControlUnet.forward.__get__(model, UNetModel)
 
-            if lora_path:
-                model = apply_lora(model, lora_path, inputs)
+                if lora_path:
+                    print(f"Applying Lora: {lora_path}")
+                    model = apply_lora(model, lora_path, inputs)
+            dynamic_axes = None if modelobj.get_static_shape() else modelobj.get_dynamic_axes()
 
+            print(f"==== input_names:\n {modelobj.get_input_names()}\n, output_names:\n {modelobj.get_output_names()}\n, dynamic_axes:\n {dynamic_axes}")
             torch.onnx.export(
                 model,
                 inputs,
@@ -93,7 +104,7 @@ def export_onnx(
                 do_constant_folding=True,
                 input_names=modelobj.get_input_names(),
                 output_names=modelobj.get_output_names(),
-                dynamic_axes=modelobj.get_dynamic_axes(),
+                dynamic_axes=dynamic_axes,
             )
 
         info("Optimize ONNX.")
@@ -143,25 +154,24 @@ def export_onnx(
 def onnx_to_refit_delta(base_path: str, lora_path: str, out_path: str, eps: int = 1e-6):
     base = gs.import_onnx(onnx.load(base_path)).toposort()
     lora = gs.import_onnx(onnx.load(lora_path)).toposort()
+    base_dict_file = base_path.replace("onnx", "trt")
+    if not os.path.exists(base_dict_file):
+        save_file({}, base_dict_file)
+
+    base_dict = load_file(base_dict_file)  # 存储base model被修改过的名称和权重
 
     def delta_to_map(refit_dict: dict, name: str, base: np.ndarray, lora: np.ndarray):
         delta = lora - base
         if np.sum(np.abs(delta)) > eps:
             refit_dict[name] = delta
+            base_dict[name] = base  # todo: 需要check一下是否一致，但是应该是一致的，毕竟同一个模型
 
     refit_dict = {}
     for n_base, n_lora in zip(base.nodes, lora.nodes):
         if n_base.op == "Constant":
             name = n_base.outputs[0].name
-            print(f"Add Constant {name}\n")
-            try:
-                delta_to_map(
-                    refit_dict, name, n_base.outputs[0].values, n_lora.outputs[0].values
-                )
-            except:
-                pass
+            delta_to_map(refit_dict, name, n_base.outputs[0].values, n_lora.outputs[0].values)
 
-        # Handle scale and bias weights
         elif n_base.op == "Conv":
             if n_base.inputs[1].__class__ == gs.Constant:
                 name = n_base.name + "_TRTKERNEL"
@@ -171,16 +181,16 @@ def onnx_to_refit_delta(base_path: str, lora_path: str, out_path: str, eps: int 
                 name = n_base.name + "_TRTBIAS"
                 delta_to_map(refit_dict, name, n_base.inputs[2].values, n_lora.inputs[2].values)
 
-        # For all other nodes: find node inputs that are initializers (AKA gs.Constant)
         else:
             for inp1, inp2 in zip(n_base.inputs, n_lora.inputs):
                 name = inp1.name
                 if inp1.__class__ == gs.Constant:
                     delta_to_map(refit_dict, name, inp1.values, inp2.values)
-    
+
     del base
     del lora
     gc.collect()
+    save_file(base_dict, base_dict_file)
     save_file(refit_dict, out_path)
 
 
@@ -202,7 +212,7 @@ def export_trt(trt_path, onnx_path, timing_cache, profile, use_fp16):
         # hwCompatibility=hwCompatibility,
     )
     e = time.time()
-    info(f"Time taken to build: {(e-s)}s")
+    info(f"Time taken to build: {(e - s)}s")
 
     shared.sd_model = model.cuda()
     return ret

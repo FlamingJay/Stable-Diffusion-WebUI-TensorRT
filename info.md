@@ -24,3 +24,22 @@ TensorRT uses optimized engines for specific resolutions and batch sizes. You ca
 Each preset can be adjusted with the "Advanced Settings" option.
 
 For more information, please visit the TensorRT Extension GitHub page [here](https://github.com/AUTOMATIC1111/stable-diffusion-webui-tensorrt).
+
+
+## Appendix 1: Pluggable Lora
+
+This version supplies pluggable lora. It has features as follows:
+1. Use cupy-cuda11x package to speed up the large matrix calculation.
+2. Separate lora into three parts: original unet, common base unet and lora. We try to make it faster, so the common base unet contains those nodes that may be changed during applying loras.
+3. If you dislike, just replace upon part with those scripts in branch lora_v2
+
+## Appendix 2: ControlNet 
+
+the ControlNet is based on the [controlnet](https://github.com/Mikubill/sd-webui-controlnet). When you want to use tensort controlnet, do as follows:
+1. Download [controlnet](https://github.com/Mikubill/sd-webui-controlnet), and put it into folder extension;
+2. Move the "controlnet/controlnet.py" and "controlnet/hook.py" into "extensions/sd-webui-controlnet/scripts" and overwrite the old scripts. 
+3. Move the yaml "controlnet/cldm_v15.yaml" into folder "extensions/sd-webui-controlnet/models" and overwrite existing yaml file;
+4. Move the "examples/engines" into root folder where launch.py exists. the "engines" script is used to load engines and is imported by contronet.py.
+
+## Appendix 3: refresh
+After generate new unet engine, please reload.

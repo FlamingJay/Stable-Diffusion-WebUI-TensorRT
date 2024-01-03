@@ -199,6 +199,7 @@ class BaseModel:
         text_maxlen=77,
         embedding_dim=768,
         controlnet=None,
+        static_shape=False
     ):
         self.name = self.__class__.__name__
         self.pipeline = pipeline.name
@@ -221,6 +222,10 @@ class BaseModel:
         self.text_maxlen = text_maxlen
         self.embedding_dim = embedding_dim
         self.extra_output_names = []
+        self.static_shape = static_shape
+
+    def get_static_shape(self):
+        pass
 
     def get_input_names(self):
         pass
@@ -350,6 +355,9 @@ class CLIP(BaseModel):
         # Output the final hidden state
         if output_hidden_states:
             self.extra_output_names = ["hidden_states"]
+
+    def get_static_shape(self):
+        return self.static_shape
 
     def get_input_names(self):
         return ["input_ids"]
@@ -594,8 +602,11 @@ class UNet(BaseModel):
     #             model = UNet2DConditionModel.from_pretrained(unet_model_dir).to(self.device)
     #     return model
 
+    def get_static_shape(self):
+        return self.static_shape
+
     def get_input_names(self):
-        if self.controlnet is None:
+        if not self.controlnet:
             return ["sample", "timestep", "encoder_hidden_states"]
         else:
             return [
@@ -610,7 +621,7 @@ class UNet(BaseModel):
         return ["latent"]
 
     def get_dynamic_axes(self):
-        if self.controlnet is None:
+        if not self.controlnet:
             return {
                 "sample": {0: "2B", 2: "H", 3: "W"},
                 "encoder_hidden_states": {0: "2B"},
@@ -644,7 +655,7 @@ class UNet(BaseModel):
         ) = self.get_minmax_dims(
             batch_size, image_height, image_width, static_batch, static_shape
         )
-        if self.controlnet is None:
+        if not self.controlnet:
             return {
                 "sample": [
                     (2 * min_batch, self.unet_dim, min_latent_height, min_latent_width),
@@ -698,7 +709,7 @@ class UNet(BaseModel):
         latent_height, latent_width = self.check_dims(
             batch_size, image_height, image_width
         )
-        if self.controlnet is None:
+        if not self.controlnet:
             return {
                 "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
                 "encoder_hidden_states": (
@@ -731,7 +742,7 @@ class UNet(BaseModel):
             batch_size, image_height, image_width
         )
         dtype = torch.float16 if self.fp16 else torch.float32
-        if self.controlnet is None:
+        if not self.controlnet:
             return (
                 torch.randn(
                     batch_size,
@@ -813,7 +824,8 @@ class OAIUNet(BaseModel):
         text_maxlen=77,
         text_optlen=77,
         unet_dim=4,
-        controlnet=None,
+        controlnet=False,
+        static_shape=False
     ):
         super(OAIUNet, self).__init__(
             version,
@@ -829,38 +841,46 @@ class OAIUNet(BaseModel):
         self.unet_dim = unet_dim
         self.controlnet = controlnet
         self.text_optlen = text_optlen
+        self.static_shape = static_shape
+
+    def get_static_shape(self):
+        return self.static_shape
 
     def get_input_names(self):
-        if self.controlnet is None:
+        if not self.controlnet:
             return ["sample", "timesteps", "encoder_hidden_states"]
         else:
-            return [
-                "sample",
-                "timesteps",
-                "encoder_hidden_states",
-                "images",
-                "controlnet_scales",
-            ]
+            return ["sample", "timesteps", "encoder_hidden_states"] + [f"control_{i}" for i in range(13)]
 
     def get_output_names(self):
         return ["latent"]
 
     def get_dynamic_axes(self):
-        if self.controlnet is None:
+        if not self.controlnet:
             return {
-                "sample": {0: "2B", 2: "H", 3: "W"},
-                "timesteps": {0: "2B"},
-                "encoder_hidden_states": {0: "2B", 1: "77N"},
-                "latent": {0: "2B", 2: "H", 3: "W"},
+                "sample": {0: "B", 2: "H", 3: "W"},
+                "timesteps": {0: "B"},
+                "encoder_hidden_states": {0: "B", 1: "77N"},
+                "latent": {0: "B", 2: "H", 3: "W"},
             }
         else:
             return {
-                "sample": {0: "2B", 2: "H", 3: "W"},
-                "timesteps": {0: "2B"},
-                "encoder_hidden_states": {0: "2B", 1: "77N"},
-                "images": {1: "2B", 3: "8H", 4: "8W"},
-                "latent": {0: "2B", 2: "H", 3: "W"},
+                "sample": {0: "B", 2: "H", 3: "W"},
+                "timesteps": {0: "B"},
+                "encoder_hidden_states": {0: "B", 1: "77N"},
+                "control_0": {0: "B", 2: "H", 3: "W"}, "control_1": {0: "B", 2: "H", 3: "W"},
+                "control_2": {0: "B", 2: "H", 3: "W"},
+                "control_3": {0: "B", 2: "H2", 3: "W2"}, "control_4": {0: "B", 2: "H2", 3: "W2"},
+                "control_5": {0: "B", 2: "H2", 3: "W2"},
+                "control_6": {0: "B", 2: "H4", 3: "W4"}, "control_7": {0: "B", 2: "H4", 3: "W4"},
+                "control_8": {0: "B", 2: "H4", 3: "W4"},
+                "control_9": {0: "B", 2: "H8", 3: "W8"}, "control_10": {0: "B", 2: "H8", 3: "W8"},
+                "control_11": {0: "B", 2: "H8", 3: "W8"}, "control_12": {0: "B", 2: "H8", 3: "W8"},
+                "latent": {0: "B", 2: "H", 3: "W"},
             }
+
+    def unet_use_controlnet(self):
+        return self.controlnet
 
     def get_input_profile(
         self,
@@ -875,9 +895,6 @@ class OAIUNet(BaseModel):
         max_w,
         static_shape,
     ):
-        min_batch, opt_batch, max_batch = self.get_batch_dim(
-            min_batch, opt_batch, max_batch, static_shape
-        )
         (
             min_latent_height,
             latent_height,
@@ -887,144 +904,101 @@ class OAIUNet(BaseModel):
             max_latent_width,
         ) = self.get_latent_dim(min_h, opt_h, max_h, min_w, opt_w, max_w, static_shape)
 
-        if self.controlnet is None:
-            return {
-                "sample": [
-                    (min_batch, self.unet_dim, min_latent_height, min_latent_width),
-                    (opt_batch, self.unet_dim, latent_height, latent_width),
-                    (max_batch, self.unet_dim, max_latent_height, max_latent_width),
-                ],
-                "timesteps": [(min_batch,), (opt_batch,), (max_batch,)],
-                "encoder_hidden_states": [
-                    (min_batch, self.text_optlen, self.embedding_dim),
-                    (opt_batch, self.text_optlen, self.embedding_dim),
-                    (max_batch, self.text_maxlen, self.embedding_dim),
-                ],
-            }
-        else:
-            return {
-                "sample": [
-                    (min_batch, self.unet_dim, min_latent_height, min_latent_width),
-                    (opt_batch, self.unet_dim, latent_height, latent_width),
-                    (max_batch, self.unet_dim, max_latent_height, max_latent_width),
-                ],
-                "timesteps": [(min_batch,), (opt_batch,), (max_batch,)],
-                "encoder_hidden_states": [
-                    (min_batch, self.text_optlen, self.embedding_dim),
-                    (opt_batch, self.text_optlen, self.embedding_dim),
-                    (max_batch, self.text_maxlen, self.embedding_dim),
-                ],
-                "images": [
-                    (
-                        len(self.controlnet),
-                        min_batch,
-                        3,
-                        min_h,
-                        min_w,
-                    ),
-                    (
-                        len(self.controlnet),
-                        opt_batch,
-                        3,
-                        opt_h,
-                        opt_w,
-                    ),
-                    (
-                        len(self.controlnet),
-                        max_batch,
-                        3,
-                        max_h,
-                        max_w,
-                    ),
-                ],
-            }
+        profile = {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (opt_batch, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timesteps": [(min_batch,), (opt_batch,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_optlen, self.embedding_dim),
+                (opt_batch, self.text_optlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+        }
+
+        if self.controlnet:
+            for i in range(13):
+                dim = 320 if i < 4 else (640 if i < 7 else 1280)
+                divide = 1 if i < 3 else (2 if i < 6 else (4 if i < 9 else 8))
+
+                profile[f"control_{i}"] = [
+                    (min_batch, dim, min_latent_height // divide, min_latent_width // divide),
+                    (opt_batch, dim, latent_height // divide, latent_width // divide),
+                    (max_batch, dim, max_latent_height // divide, max_latent_width // divide)
+                ]
+
+        return profile
 
     def get_shape_dict(self, batch_size, image_height, image_width):
         latent_height, latent_width = self.check_dims(
             batch_size, image_height, image_width
         )
-        if self.controlnet is None:
+        if not self.controlnet:
             return {
-                "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
-                "timesteps": (2 * batch_size,),
+                "sample": (batch_size, self.unet_dim, latent_height, latent_width),
+                "timesteps": (batch_size,),
                 "encoder_hidden_states": (
-                    2 * batch_size,
+                    batch_size,
                     self.text_optlen,
                     self.embedding_dim,
                 ),
-                "latent": (2 * batch_size, 4, latent_height, latent_width),
+                "latent": (batch_size, 4, latent_height, latent_width),
             }
         else:
             return {
-                "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
-                "timesteps": (2 * batch_size,),
+                "sample": (batch_size, self.unet_dim, latent_height, latent_width),
+                "timesteps": (batch_size,),
                 "encoder_hidden_states": (
-                    2 * batch_size,
+                    batch_size,
                     self.text_optlen,
                     self.embedding_dim,
                 ),
-                "images": (
-                    len(self.controlnet),
-                    2 * batch_size,
-                    3,
-                    image_height,
-                    image_width,
-                ),
-                "latent": (2 * batch_size, 4, latent_height, latent_width),
+                "latent": (batch_size, 4, latent_height, latent_width),
+                # todo: need to add controls
             }
 
     def get_sample_input(self, batch_size, image_height, image_width):
-        latent_height, latent_width = self.check_dims(
-            batch_size, image_height, image_width
-        )
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
         dtype = torch.float16 if self.fp16 else torch.float32
-        if self.controlnet is None:
+        if self.controlnet:
             return (
-                torch.randn(
-                    2 * batch_size,
-                    self.unet_dim,
-                    latent_height,
-                    latent_width,
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device),
-                torch.randn(
-                    2 * batch_size,
-                    self.text_optlen,
-                    self.embedding_dim,
-                    dtype=dtype,
-                    device=self.device,
-                ),
+                torch.randn(batch_size, self.unet_dim, latent_height, latent_width, dtype=dtype,
+                            device=self.device, ),
+                torch.ones((batch_size,), dtype=dtype, device=self.device),
+                torch.randn(batch_size, self.text_optlen, self.embedding_dim, dtype=dtype, device=self.device, ),
+                # control的list
+                torch.randn(batch_size, 320, latent_height, latent_width, dtype=dtype, device=self.device, ),
+                torch.randn(batch_size, 320, latent_height, latent_width, dtype=dtype, device=self.device, ),
+                torch.randn(batch_size, 320, latent_height, latent_width, dtype=dtype, device=self.device, ),
+                torch.randn(batch_size, 320, latent_height // 2, latent_width // 2, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 640, latent_height // 2, latent_width // 2, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 640, latent_height // 2, latent_width // 2, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 640, latent_height // 4, latent_width // 4, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 1280, latent_height // 4, latent_width // 4, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 1280, latent_height // 4, latent_width // 4, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 1280, latent_height // 8, latent_width // 8, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 1280, latent_height // 8, latent_width // 8, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 1280, latent_height // 8, latent_width // 8, dtype=dtype,
+                            device=self.device, ),
+                torch.randn(batch_size, 1280, latent_height // 8, latent_width // 8, dtype=dtype,
+                            device=self.device, )
             )
         else:
             return (
-                torch.randn(
-                    batch_size,
-                    self.unet_dim,
-                    latent_height,
-                    latent_width,
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
+                torch.randn(batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32,
+                            device=self.device, ),
                 torch.ones((batch_size,), dtype=torch.float32, device=self.device),
-                torch.randn(
-                    batch_size,
-                    self.text_optlen,
-                    self.embedding_dim,
-                    dtype=dtype,
-                    device=self.device,
-                ),
-                torch.randn(
-                    len(self.controlnet),
-                    batch_size,
-                    3,
-                    image_height,
-                    image_width,
-                    dtype=dtype,
-                    device=self.device,
-                ),
-                torch.randn(len(self.controlnet), dtype=dtype, device=self.device),
+                torch.randn(batch_size, self.text_optlen, self.embedding_dim, dtype=dtype, device=self.device, ),
             )
 
 
@@ -1037,6 +1011,7 @@ def make_OAIUNet(
     text_optlen,
     text_maxlen,
     controlnet=None,
+    static_shape=False
 ):
     return OAIUNet(
         version,
@@ -1048,7 +1023,8 @@ def make_OAIUNet(
         text_optlen=text_optlen,
         text_maxlen=text_maxlen,
         unet_dim=(9 if pipeline.is_inpaint() else 4),
-        controlnet=get_controlnets_path(controlnet),
+        controlnet=controlnet,
+        static_shape=static_shape
     )
 
 
@@ -1082,6 +1058,9 @@ class OAIUNetXL(BaseModel):
         self.time_dim = time_dim
         self.num_classes = num_classes
         self.text_optlen = text_optlen
+
+    def get_static_shape(self):
+        return self.static_shape
 
     def get_input_names(self):
         return ["sample", "timesteps", "encoder_hidden_states", "y"]
@@ -1225,6 +1204,9 @@ class VAE(BaseModel):
             max_batch_size=max_batch_size,
         )
 
+    def get_static_shape(self):
+        return self.static_shape
+
     def get_input_names(self):
         return ["latent"]
 
@@ -1318,6 +1300,9 @@ class VAEEncoder(BaseModel):
             max_batch_size=max_batch_size,
         )
 
+    def get_static_shape(self):
+        return self.static_shape
+
     def get_input_names(self):
         return ["images"]
 
@@ -1390,3 +1375,113 @@ def make_VAEEncoder(version, pipeline, hf_token, device, verbose, max_batch_size
         verbose=verbose,
         max_batch_size=max_batch_size,
     )
+
+
+class ControlNetModel(BaseModel):
+    def __init__(self, version, pipeline, device="cuda", verbose=True, fp16=False,
+                 max_batch_size=16, text_maxlen=77, text_optlen=77, unet_dim=4, static_shape=False):
+        super(ControlNetModel, self).__init__(version, pipeline, "", fp16=fp16, device=device, verbose=verbose,
+                                              max_batch_size=max_batch_size, text_maxlen=text_maxlen,
+                                              embedding_dim=768, static_shape=False)
+        self.unet_dim = unet_dim
+        self.text_optlen = text_optlen
+        self.static_shape = static_shape
+
+    def get_static_shape(self):
+        return self.static_shape
+
+    def unet_use_controlnet(self):
+        return False
+
+    def get_input_names(self):
+        return ["sample", "images", "timesteps", "encoder_hidden_states"]
+
+    def get_output_names(self):
+        return [f"control_{i}" for i in range(13)]
+
+    def get_dynamic_axes(self):
+        """
+        :return:
+        """
+        return {
+            "sample": {0: "B", 2: "H", 3: "W"},
+            "timesteps": {0: "B"},
+            "images": {2: "8H", 3: "8W"},
+            "encoder_hidden_states": {0: "B", 1: "77N"},
+            "control_0": {0: "B"}, "control_1": {0: "B"},
+            "control_2": {0: "B"}, "control_3": {0: "B"},
+            "control_4": {0: "B"}, "control_5": {0: "B"},
+            "control_6": {0: "B"}, "control_7": {0: "B"},
+            "control_8": {0: "B"}, "control_9": {0: "B"},
+            "control_10": {0: "B"}, "control_11": {0: "B"},
+            "control_12": {0: "B"}
+        }
+
+    def get_input_profile(self, min_batch, opt_batch, max_batch, min_h, opt_h, max_h, min_w, opt_w, max_w,
+                          static_shape):
+        """
+        输出原始unet相关的配置，是为了拿到后面inputs
+        :param min_batch:
+        :param opt_batch:
+        :param max_batch:
+        :param min_h:
+        :param opt_h:
+        :param max_h:
+        :param min_w:
+        :param opt_w:
+        :param max_w:
+        :param static_shape:
+        :return:
+        """
+
+        (
+            min_latent_height, latent_height, max_latent_height,
+            min_latent_width, latent_width, max_latent_width,
+        ) = self.get_latent_dim(min_h, opt_h, max_h, min_w, opt_w, max_w, static_shape)
+
+        profile = {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (opt_batch, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timesteps": [(min_batch,), (opt_batch,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_optlen, self.embedding_dim),
+                (opt_batch, self.text_optlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+        }
+
+        return profile
+
+    def get_input_profile_v2(self, unet_profile):
+        out_profile = {"sample": unet_profile["sample"], "timesteps": unet_profile["timesteps"],
+                       "encoder_hidden_states": unet_profile["encoder_hidden_states"]}
+
+        _, udim, min_height, min_width = unet_profile["sample"][0]
+        _, udim, opt_height, opt_width = unet_profile["sample"][1]
+        _, udim, max_height, max_width = unet_profile["sample"][2]
+        out_profile["images"] = [
+            (1, 3, min_height * 8, min_width * 8),
+            (1, 3, opt_height * 8, opt_width * 8),
+            (1, 3, max_height * 8, max_width * 8)
+        ]
+
+        return out_profile
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+
+        return (
+            torch.randn(batch_size, self.unet_dim, latent_height, latent_width, dtype=dtype,
+                        device=self.device, ),
+            torch.randn(1, 3, image_height, image_width, dtype=dtype, device=self.device, ),
+            torch.ones((batch_size,), dtype=dtype, device=self.device),
+            torch.randn(batch_size, self.text_optlen, self.embedding_dim, dtype=dtype, device=self.device, ),
+        )
+
+def make_ControlNet(version, pipeline, device, verbose, text_maxlen, text_optlen, static_shape):
+    return ControlNetModel(version=version, pipeline=pipeline, device=device, fp16=True, verbose=verbose,
+                           text_maxlen=text_maxlen, text_optlen=text_optlen, static_shape=static_shape)

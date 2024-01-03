@@ -1,5 +1,5 @@
 import os
-
+import json
 from modules import sd_models, shared
 import gradio as gr
 
@@ -9,7 +9,7 @@ from modules.ui_components import FormRow
 
 from exporter import export_onnx, export_trt, onnx_to_refit_delta
 from utilities import PIPELINE_TYPE, Engine
-from models_helper import make_OAIUNetXL, make_OAIUNet
+from models import make_OAIUNetXL, make_OAIUNet, make_ControlNet
 import logging
 import gc
 import torch
@@ -18,6 +18,9 @@ from time import sleep
 from collections import defaultdict
 from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
+
+from ldm.util import instantiate_from_config
+from omegaconf import OmegaConf
 
 logging.basicConfig(level=logging.INFO)
 
@@ -47,8 +50,16 @@ def export_unet_to_trt(
     force_export,
     static_shapes,
     preset,
-    controlnet=None,
+    controlnet,
+    trt_name: str
 ):
+    print(f"==== export_unet_to_trt params: \n "
+          f"batch_min: {batch_min}, batch_opt: {batch_opt}, batch_max: {batch_max}\n"
+          f"height_min: {height_min}, height_opt: {height_opt}, height_max: {height_max}\n"
+          f"width_min: {width_min}, width_opt: {width_opt}, width_max: {width_max}\n"
+          f"token_count_min: {token_count_min}, token_count_opt: {token_count_opt}, token_count_max: {token_count_max}\n"
+          f"force_export: {force_export}, static_shapes: {static_shapes}, preset: {preset}, controlnet: {controlnet},\n"
+          f"trt_name: {trt_name}")
 
     if preset == "Default":
         (
@@ -76,7 +87,9 @@ def export_unet_to_trt(
         is_inpaint = True
 
     model_hash = shared.sd_model.sd_checkpoint_info.hash
-    model_name = shared.sd_model.sd_checkpoint_info.model_name
+    model_name = shared.sd_model.sd_checkpoint_info.model_name # todo: 这里要不要加上controlnet的标志呢？
+    if controlnet:
+        model_name += "-control"
     onnx_filename, onnx_path = modelmanager.get_onnx_path(model_name, model_hash)
 
     print(f"Exporting {model_name} to TensorRT")
@@ -88,13 +101,15 @@ def export_unet_to_trt(
     pipeline = PIPELINE_TYPE.TXT2IMG
     if is_inpaint:
         pipeline = PIPELINE_TYPE.INPAINT
-    controlnet = None
 
     min_textlen = (token_count_min // 75) * 77
     opt_textlen = (token_count_opt // 75) * 77
     max_textlen = (token_count_max // 75) * 77
     if static_shapes:
         min_textlen = max_textlen = opt_textlen
+        batch_min = batch_max = batch_opt
+        width_min = width_max = width_opt
+        height_min = height_max = height_opt
 
     if shared.sd_model.is_sdxl:
         pipeline = PIPELINE_TYPE.SD_XL_BASE
@@ -112,6 +127,7 @@ def export_unet_to_trt(
             opt_textlen,
             max_textlen,
             controlnet,
+            static_shapes
         )
         diable_optimizations = False
 
@@ -129,7 +145,7 @@ def export_unet_to_trt(
     )
     print(profile)
 
-    if not os.path.exists(onnx_path):
+    if not os.path.exists(onnx_path) or force_export:
         print("No ONNX file found. Exporting ONNX...")
         gr.Info("No ONNX file found. Exporting ONNX...  Please check the progress in the terminal.")
         export_onnx(
@@ -140,10 +156,15 @@ def export_unet_to_trt(
         )
         print("Exported to ONNX.")
 
-    trt_engine_filename, trt_path = modelmanager.get_trt_path(
-        model_name, model_hash, profile, static_shapes
-    )
-
+    if "" == trt_name:
+        trt_engine_filename, trt_path = modelmanager.get_trt_path(
+            model_name, model_hash, profile, static_shapes
+        )
+    else:
+        if not trt_name.endswith(".trt"):
+            trt_name += ".trt"
+        trt_engine_filename, trt_path = trt_name, os.path.join(TRT_MODEL_DIR, trt_name)
+    # todo: 截断
     if not os.path.exists(trt_path) or force_export:
         print("Building TensorRT engine... This can take a while, please check the progress in the terminal.")
         gr.Info("Building TensorRT engine... This can take a while, please check the progress in the terminal.")
@@ -162,7 +183,7 @@ def export_unet_to_trt(
         print("TensorRT engines has been saved to disk.")
         modelmanager.add_entry(
             model_name,
-            model_hash,
+            trt_engine_filename,
             profile,
             static_shapes,
             fp32=use_fp32,
@@ -178,7 +199,26 @@ def export_unet_to_trt(
     return "## Exported Successfully \n"
 
 
-def export_lora_to_trt(lora_name, force_export):
+def export_lora_to_trt(base_model_name, profile_info, lora_name, force_export, no_refit):
+    print(f"==== base_model_name: {base_model_name}, profile_info: {profile_info}, lora_name: {lora_name}")
+
+    # 默认的unet profile
+    all_models = modelmanager.available_models()
+    base_model_config = all_models[base_model_name]
+    unet_profile = None
+    profile_idx = int(profile_info.split("_")[0])
+    static_shapes = False
+    if profile_idx < len(base_model_config):
+        static_shapes = base_model_config[profile_idx]['config'].static_shapes
+        unet_profile = base_model_config[profile_idx]['config'].profile
+
+    if unet_profile is None:
+        raise ValueError("Selected ControlUnet Config doesn't exist in model.json.")
+
+    use_controlnet = len(unet_profile.keys()) > 3
+    batch_max = unet_profile["sample"][2][0]
+    opt_len, max_len = unet_profile["encoder_hidden_states"][-2][1], unet_profile["encoder_hidden_states"][-1][1]
+
     is_inpaint = False
     use_fp32 = False
     if cc_major < 7:
@@ -190,6 +230,8 @@ def export_lora_to_trt(lora_name, force_export):
 
     model_hash = shared.sd_model.sd_checkpoint_info.hash
     model_name = shared.sd_model.sd_checkpoint_info.model_name
+    if use_controlnet:
+        model_name += "-control"
     base_name = f"{model_name}"  # _{model_hash}
 
     available_lora_models = get_lora_checkpoints()
@@ -214,27 +256,27 @@ def export_lora_to_trt(lora_name, force_export):
         modelobj = make_OAIUNetXL(version, pipeline, "cuda", False, 1, 77, 77)
         diable_optimizations = True
     else:
+        print(f"===== len(unet_profile.keys()): {len(unet_profile.keys())}, use_controlnet: {use_controlnet}")
         modelobj = make_OAIUNet(
-            version,
-            pipeline,
-            "cuda",
-            False,
-            1,
-            77,
-            77,
-            None,
+            version=version,
+            pipeline=pipeline,
+            device="cuda",
+            verbose=False,
+            max_batch_size=batch_max,
+            text_optlen=opt_len,
+            text_maxlen=max_len,
+            controlnet=use_controlnet,
+            static_shape=static_shapes
         )
         diable_optimizations = False
 
-    if not os.path.exists(onnx_lora_path):
+    if not os.path.exists(onnx_lora_path) or force_export:
         print("No ONNX file found. Exporting ONNX...")
         gr.Info("No ONNX file found. Exporting ONNX...  Please check the progress in the terminal.")
         export_onnx(
             onnx_lora_path,
             modelobj,
-            profile=modelobj.get_input_profile(
-                1, 1, 1, 512, 512, 512, 512, 512, 512, True
-            ),
+            profile=unet_profile,
             diable_optimizations=diable_optimizations,
             lora_path=lora_model["filename"],
         )
@@ -246,14 +288,29 @@ def export_lora_to_trt(lora_name, force_export):
     available_trt_unet = modelmanager.available_models()
     if len(available_trt_unet[base_name]) == 0:
         return f"## Please export the base model ({base_name}) first."
-    
+
     if not os.path.exists(onnx_base_path):
         return f"## Please export the base model ({base_name}) first."
 
     if not os.path.exists(trt_lora_path) or force_export:
-        print("Saving to TensorRT format...")
-        gr.Info("Saving to TensorRT format...")
-        onnx_to_refit_delta(onnx_base_path, onnx_lora_path, trt_lora_path)
+        print("Building TensorRT engine... This can take a while, please check the progress in the terminal.")
+        gr.Info("Building TensorRT engine... This can take a while, please check the progress in the terminal.")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if no_refit:
+            timing_cache = modelmanager.get_timing_cache()
+            ret = export_trt(
+                trt_lora_path,
+                onnx_lora_path,
+                timing_cache,
+                profile=unet_profile,
+                use_fp16=not use_fp32,
+            )
+            if ret:
+                return "## Export Failed due to unknown reason. See shell for more information. \n"
+        else:
+            onnx_to_refit_delta(onnx_base_path, onnx_lora_path, trt_lora_path)
 
         modelmanager.add_lora_entry(
             base_name,
@@ -264,6 +321,8 @@ def export_lora_to_trt(lora_name, force_export):
             0,
             unet_hidden_dim,
         )
+
+        print("TensorRT engines has been saved to disk.")
 
     return "## Exported Successfully \n"
 
@@ -298,6 +357,128 @@ def export_default_unet_to_trt():
         token_count_opt,
         token_count_max,
     )
+
+
+def load_control_model(control_name):
+    control_model_path = os.path.join(shared.cmd_opts.control_dir, control_name + ".pth")
+
+    # 加载模型
+    config_path = os.path.join(shared.cmd_opts.control_dir, "cldm_v15.yaml")
+    config = OmegaConf.load(config_path)
+
+    def get_state_dict(d):
+        return d.get('state_dict', d)
+
+    def get_state_dicts(ckpt_path, location='cuda'):
+        _, extension = os.path.splitext(ckpt_path)
+        if extension.lower() == ".safetensors":
+            import safetensors.torch
+            state_dict = safetensors.torch.load_file(ckpt_path, device=location)
+        else:
+            state_dict = get_state_dict(torch.load(ckpt_path, map_location=torch.device(location)))
+        state_dict = get_state_dict(state_dict)
+        print(f'Loaded state_dict from [{ckpt_path}]')
+        return state_dict
+
+    state_dicts = get_state_dicts(control_model_path)
+    controlnet_config = config["model"]['params']['control_stage_config']
+    controlnet_model = instantiate_from_config(controlnet_config)
+
+    controlnet_dicts = {k: state_dicts["control_model." + k] for k in controlnet_model.state_dict()}
+    controlnet_model.load_state_dict(controlnet_dicts)
+    controlnet_model = controlnet_model.to(torch.device("cuda"))
+    controlnet_model.eval()
+
+    return controlnet_model
+
+
+def export_controlnet_to_trt(base_model_name, profile_info, control_name, force_export):
+    print(f"==== base_model_name: {base_model_name}, profile_info: {profile_info}, lora_name: {control_name}")
+
+    # 默认的unet profile
+    all_models = modelmanager.available_models()
+    base_model_config = all_models[base_model_name]
+    unet_profile = None
+    profile_idx = int(profile_info.split("_")[0])
+    static_shapes = False
+    if profile_idx < len(base_model_config):
+        static_shapes = base_model_config[profile_idx]['config'].static_shapes
+        unet_profile = base_model_config[profile_idx]['config'].profile
+
+    if unet_profile is None:
+        raise ValueError("Selected ControlUnet Config doesn't exist in model.json.")
+    opt_len, max_len = unet_profile["encoder_hidden_states"][-2][1], unet_profile["encoder_hidden_states"][-1][1]
+    print(f"==== opt_len: {opt_len}, max_len: {max_len}")
+    is_inpaint = False
+    use_fp32 = False
+    if cc_major < 7:
+        use_fp32 = True
+        print("FP16 has been disabled because your GPU does not support it.")
+    unet_hidden_dim = shared.sd_model.model.diffusion_model.in_channels
+    if unet_hidden_dim == 9:
+        is_inpaint = True
+
+    onnx_control_filename, onnx_control_path = modelmanager.get_onnx_path(
+        control_name, base_model_name
+    )
+    timing_cache = modelmanager.get_timing_cache()
+
+    version = get_version_from_model(shared.sd_model)
+
+    pipeline = PIPELINE_TYPE.TXT2IMG
+    if is_inpaint:
+        pipeline = PIPELINE_TYPE.INPAINT
+
+    modelobj = make_ControlNet(version, pipeline, "cuda", False, max_len, opt_len, static_shapes)
+    diable_optimizations = False
+    control_profile = modelobj.get_input_profile_v2(unet_profile)
+    controlnet_model = load_control_model(control_name)
+    if not os.path.exists(onnx_control_path) or force_export:
+        print("No ONNX file found. Exporting ONNX...")
+        gr.Info("No ONNX file found. Exporting ONNX...  Please check the progress in the terminal.")
+        export_onnx(
+            onnx_control_path,
+            modelobj,
+            profile=control_profile,
+            diable_optimizations=diable_optimizations,
+            model=controlnet_model
+        )
+        print("Exported to ONNX.")
+
+    trt_control_name = onnx_control_filename.replace(".onnx", ".trt")
+    trt_control_path = os.path.join(TRT_MODEL_DIR, trt_control_name)
+
+    # todo: 截断
+    if not os.path.exists(trt_control_path) or force_export:
+        print("Building TensorRT engine... This can take a while, please check the progress in the terminal.")
+        gr.Info("Building TensorRT engine... This can take a while, please check the progress in the terminal.")
+        gc.collect()
+        torch.cuda.empty_cache()
+        ret = export_trt(
+            trt_control_path,
+            onnx_control_path,
+            timing_cache,
+            profile=control_profile,
+            use_fp16=not use_fp32,
+        )
+        if ret:
+            return "## Export Failed due to unknown reason. See shell for more information. \n"
+
+        print("TensorRT engines has been saved to disk.")
+        modelmanager.add_controlnet_entry(
+            base_model=base_model_name,
+            control_name=control_name,
+            trt_control_path=trt_control_path,
+            fp32=use_fp32,
+            inpaint=is_inpaint,
+            vram=0,
+            unet_hidden_dim=unet_hidden_dim,
+        )
+    else:
+        print("TensorRT engine found. Skipping build. You can enable Force Export in the Advanced Settings to force a rebuild if needed.")
+
+    return "## Exported Successfully \n"
+
 
 
 profile_presets = {
@@ -462,7 +643,8 @@ def engine_profile_card():
             if m["config"].lora:
                 loras_md[base_model] = m.get("base_model", None)
                 continue
-
+            if "base_model" in m:
+                continue
             s_min, s_opt, s_max = m["config"].profile.get(
                 "sample", [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
             )
@@ -525,6 +707,12 @@ def get_lora_checkpoints(): #TODO
     return available_lora_models
 
 
+def refresh_lora_all():
+    unets = get_valid_unet_trt()
+    loras = get_valid_lora_checkpoints()
+    return unets, loras
+
+
 def get_valid_lora_checkpoints():
     available_lora_models = get_lora_checkpoints()
     return [
@@ -533,6 +721,81 @@ def get_valid_lora_checkpoints():
         if v["version"] == get_version_from_model(shared.sd_model)
         or v["version"] == "Unknown"
     ]
+
+
+def get_valid_controlnet_checkpoints():
+    available_control_models = set()
+    candidates = list(shared.walk_files(shared.cmd_opts.control_dir,
+                                        allowed_extensions=[".pth"]))
+    for filename in candidates:
+        name = os.path.splitext(os.path.basename(filename))[0]
+        available_control_models.add(name)
+
+    return list(available_control_models)
+
+
+def get_valid_unet_trt():
+    """
+    读取model.json文件，并且和目录下对应的进行match，存在的才加入到里面来
+    """
+    with open(os.path.join(TRT_MODEL_DIR, "model.json"), "r") as f:
+        out = json.load(f)
+
+    base_model_names = set()
+    for cc, models in out.items():
+        for name, configs in models.items():
+            for config in configs:
+                if os.path.exists(os.path.join(TRT_MODEL_DIR, config["filepath"])) and ("base_model" not in config):
+                    base_model_names.add(name)
+
+    return list(base_model_names)
+
+
+def get_valid_controlunet_trt():
+    with open(os.path.join(TRT_MODEL_DIR, "model.json"), "r") as f:
+        out = json.load(f)
+
+    base_model_names = set()
+    for cc, models in out.items():
+        for name, configs in models.items():
+            for config in configs:
+                if os.path.exists(os.path.join(TRT_MODEL_DIR, config["filepath"])) and ("base_model" not in config):
+                    if len(config["config"]["profile"].keys()) > 13:
+                        base_model_names.add(name)
+
+    return list(base_model_names)
+
+
+def select_unet_profile(unet_name):
+    with open(os.path.join(TRT_MODEL_DIR, "model.json"), "r") as f:
+        out = json.load(f)
+
+    profiles = set()
+    for cc, models in out.items():
+        for name, configs in models.items():
+            if name == unet_name:
+                for idx, config in enumerate(configs):
+                    profiles.add(str(idx) + "_" + config["filepath"])
+                break
+
+    res = gr.Dropdown.update(choices=list(profiles), label="profiles")
+    return res
+
+
+def select_unet_control_profile(unet_name):
+    with open(os.path.join(TRT_MODEL_DIR, "model.json"), "r") as f:
+        out = json.load(f)
+
+    profiles = set()
+    for cc, models in out.items():
+        for name, configs in models.items():
+            if name == unet_name:
+                for idx, config in enumerate(configs):
+                    if len(config["config"]["profile"]) == 16:
+                        profiles.add(str(idx) + "_" + config["filepath"])
+                break
+    res = gr.Dropdown.update(choices=list(profiles), label="profiles")
+    return res
 
 
 def on_ui_tabs():
@@ -670,14 +933,28 @@ def on_ui_tabs():
                                     elem_id="trt_opt_token_count_max",
                                 )
 
-                            with FormRow(
-                                elem_classes="checkboxes-row", variant="compact"
-                            ):
+                            with FormRow(elem_classes="checkboxes-row", variant="compact"):
                                 force_rebuild = gr.Checkbox(
                                     label="Force Rebuild.",
                                     value=False,
                                     elem_id="trt_force_rebuild",
                                 )
+
+                        with FormRow(elem_classes="checkboxes-row", variant="compact"):
+                            use_controlnet = gr.Checkbox(
+                                label="Use ControlNet.",
+                                value=False,
+                                elem_id="trt_use_controlnet",
+                                visible=True
+                            )
+
+                        with FormRow(elem_classes="checkboxes-row", variant="compact"):
+                            trt_name = gr.Textbox(
+                                lines=1,
+                                placeholder="trt engine name",
+                                elem_id="trt_name",
+                                visible=True
+                            )
 
                         button_export_unet = gr.Button(
                             value="Export Engine",
@@ -741,6 +1018,20 @@ def on_ui_tabs():
                             elem_id="trt_lora_refresh",
                         )
 
+                        trt_unet_dropdown = gr.Dropdown(
+                            choices=get_valid_unet_trt(),
+                            elem_id="unet_trt",
+                            label="Unet Trt",
+                            visible=True
+                        )
+
+                        trt_unet_profile_dropdown = gr.Dropdown(
+                            choices=[],
+                            elem_id="unet_profile",
+                            label="Unet Profile",
+                            visible=True
+                        )
+
                         trt_lora_dropdown = gr.Dropdown(
                             choices=get_valid_lora_checkpoints(),
                             elem_id="lora_model",
@@ -754,21 +1045,65 @@ def on_ui_tabs():
                                 value=False,
                                 elem_id="trt_lora_force_rebuild",
                             )
+                        with FormRow(elem_classes="checkboxes-row", variant="compact"):
+                            no_refit = gr.Checkbox(
+                                label="No refit.",
+                                value=False,
+                                elem_id="trt_lora_no_refit",
+                            )
 
                         button_export_lora_unet = gr.Button(
                             value="Convert to TensorRT",
                             variant="primary",
                             elem_id="trt_lora_export_unet",
-                            visible=False,
+                            visible=True,
                         )
 
                         lora_refresh_button.click(
-                            get_valid_lora_checkpoints,
+                            refresh_lora_all,
                             None,
-                            trt_lora_dropdown,
+                            [trt_unet_dropdown, trt_lora_dropdown],
                         )
                         trt_lora_dropdown.change(
                             disable_lora_export, trt_lora_dropdown, button_export_lora_unet
+                        )
+
+
+                    with gr.Tab(label="TensorRT ControlNet"):
+                        gr.Markdown("# Transfer ControlNet Model to TensorRT model")
+
+                        trt_controlunet_dropdown = gr.Dropdown(
+                            choices=get_valid_controlunet_trt(),
+                            elem_id="controlunet_trt",
+                            label="ControlUnet Trt",
+                            default=None,
+                        )
+
+                        trt_controlunet_profile_dropdown = gr.Dropdown(
+                            choices=[],
+                            elem_id="controlunet_profile",
+                            label="ControlUnet Profiles",
+                        )
+
+                        trt_control_dropdown = gr.Dropdown(
+                            choices=get_valid_controlnet_checkpoints(),
+                            elem_id="controlnet_model",
+                            label="ControlNet Model",
+                            default=None,
+                        )
+
+                        with FormRow(elem_classes="checkboxes-row", variant="compact"):
+                            trt_control_force_rebuild = gr.Checkbox(
+                                label="Force Rebuild.",
+                                value=False,
+                                elem_id="trt_control_force_rebuild",
+                            )
+
+                        button_export_controlnet = gr.Button(
+                            value="Convert to TensorRT",
+                            variant="primary",
+                            elem_id="trt_export_controlnet",
+                            visible=True,
                         )
 
             with gr.Column(variant="panel"):
@@ -802,7 +1137,19 @@ def on_ui_tabs():
                 )
             with gr.Row(equal_height=True):
                 trt_profiles_markdown = gr.Markdown(elem_id=f"trt_profiles_markdown", value=get_trt_profiles_markdown())
-        
+
+        trt_unet_dropdown.change(
+            select_unet_profile,
+            trt_unet_dropdown,
+            [trt_unet_profile_dropdown]
+        )
+
+        trt_controlunet_dropdown.change(
+            select_unet_control_profile,
+            trt_controlunet_dropdown,
+            [trt_controlunet_profile_dropdown]
+        )
+
         button_refresh_profiles.click(lambda: gr.Markdown.update(value=get_trt_profiles_markdown()), outputs=[trt_profiles_markdown])
 
         button_export_unet.click(
@@ -823,6 +1170,8 @@ def on_ui_tabs():
                 force_rebuild,
                 static_shapes,
                 version,
+                use_controlnet,
+                trt_name
             ],
             outputs=[trt_result],
         )
@@ -845,14 +1194,22 @@ def on_ui_tabs():
                 force_rebuild,
                 static_shapes,
                 version,
+                use_controlnet,
+                trt_name
             ],
             outputs=[trt_result],
         )
 
         button_export_lora_unet.click(
             export_lora_to_trt,
-            inputs=[trt_lora_dropdown, trt_lora_force_rebuild],
+            inputs=[trt_unet_dropdown, trt_unet_profile_dropdown, trt_lora_dropdown, trt_lora_force_rebuild, no_refit],
             outputs=[trt_result],
-        )
+        ) # todo: refresh unet
+
+        button_export_controlnet.click(
+            export_controlnet_to_trt,
+            inputs=[trt_controlunet_dropdown, trt_controlunet_profile_dropdown, trt_control_dropdown, trt_control_force_rebuild],
+            outputs=[trt_result]
+        )  # todo: refresh all
 
     return [(trt_interface, "TensorRT", "tensorrt")]

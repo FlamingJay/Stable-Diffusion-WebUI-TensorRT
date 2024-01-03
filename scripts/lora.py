@@ -1,51 +1,37 @@
-import os
+import time
 from typing import List
-import numpy as np
 from safetensors.numpy import load_file
-import onnx_graphsurgeon as gs
-import onnx
+import cupy as cp
+import numpy as np
 
 
-def merge_loras(loras: List[str], scales: List[str]):
+# TODO really not that efficient, but improves usability greatly
+def merge_loras(base: str, loras: List[str], scales: List[str]):
+    """
+    todo: 需要确定不同lora的keys是否相同
+    """
+    start = time.time()
+    base_dict = load_file(base)
+    print(f"**** load base model time cost: {time.time() - start}s ****")
     refit_dict = {}
+    start = time.time()
     for lora, scale in zip(loras, scales):
+        second = time.time()
         lora_dict = load_file(lora)
+        print(f"**** load lora file count: {len(lora_dict)}, time cost: {time.time() - second}s ****")
         for k, v in lora_dict.items():
             if k in refit_dict:
-                refit_dict[k] += scale * v
+                refit_dict[k] += scale * cp.array(v)
             else:
-                refit_dict[k] = scale * v
+                refit_dict[k] = cp.array(base_dict[k]) + scale * cp.array(v)
+    print(f"**** merge weight dict time cost: {time.time() - start}s ****")
     return refit_dict
 
 
 def apply_loras(base_path: str, loras: List[str], scales: List[str]) -> dict:
-    refit_dict = merge_loras(loras, scales)
-    base = gs.import_onnx(onnx.load(base_path)).toposort()
+    if base_path.endswith(".onnx"):
+        base_path = base_path.replace("onnx", "trt")
 
-    def add_to_map(refit_dict, name, value):
-        if name in refit_dict:
-            refit_dict[name] += value
-
-    for n in base.nodes:
-        if n.op == "Constant":
-            name = n.outputs[0].name
-            add_to_map(refit_dict, name, n.outputs[0].values)
-
-        # Handle scale and bias weights
-        elif n.op == "Conv":
-            if n.inputs[1].__class__ == gs.Constant:
-                name = n.name + "_TRTKERNEL"
-                add_to_map(refit_dict, name, n.inputs[1].values)
-
-            if n.inputs[2].__class__ == gs.Constant:
-                name = n.name + "_TRTBIAS"
-                add_to_map(refit_dict, name, n.inputs[2].values)
-
-        # For all other nodes: find node inputs that are initializers (AKA gs.Constant)
-        else:
-            for inp in n.inputs:
-                name = inp.name
-                if inp.__class__ == gs.Constant:
-                    add_to_map(refit_dict, name, inp.values)
+    refit_dict = merge_loras(base_path, loras, scales)
 
     return refit_dict
